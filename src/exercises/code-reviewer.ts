@@ -1,5 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { config } from "../config.js";
+import { CODE_REVIEWER_PROMPT } from "../llm/prompts.js";
 
 const anthropic = new Anthropic({ apiKey: config.anthropicApiKey });
 
@@ -10,6 +11,25 @@ interface CodeSample {
 }
 
 const SAMPLES: CodeSample[] = [
+  {
+    name: "Fragmento con SQL injection y comparación débil",
+    language: "javascript",
+    code: `async function getUser(id) {
+  const query = "SELECT * FROM users WHERE id = " + id;
+  const result = await db.query(query);
+  return result[0];
+}
+
+function calcularDescuento(precio, tipo) {
+  if (tipo == "vip") {
+    return precio * 0.8;
+  } else if (tipo == "regular") {
+    return precio * 0.9;
+  } else {
+    return precio;
+  }
+}`,
+  },
   {
     name: "Autenticación JWT con secreto débil",
     language: "javascript",
@@ -59,23 +79,15 @@ async function reviewCode(sample: CodeSample): Promise<string> {
   const response = await anthropic.messages.create({
     model: config.anthropicModel,
     max_tokens: 2048,
+    system: CODE_REVIEWER_PROMPT,
     messages: [
       {
         role: "user",
-        content: `Eres un experto en code review. Analiza el siguiente código ${sample.language} e identifica:
+        content: `Código ${sample.language} a revisar:
 
-1. **Bugs o errores lógicos**
-2. **Vulnerabilidades de seguridad**
-3. **Problemas de rendimiento**
-4. **Violaciones de buenas prácticas**
-5. **Versión mejorada del código**
-
-Código a revisar:
 \`\`\`${sample.language}
 ${sample.code}
-\`\`\`
-
-Sé específico y proporciona código corregido.`,
+\`\`\``,
       },
     ],
   });
