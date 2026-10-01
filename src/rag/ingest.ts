@@ -1,53 +1,16 @@
-import { readdir, readFile } from "fs/promises";
-import { join, extname } from "path";
-import Database from "better-sqlite3";
-import OpenAI from "openai";
+import { mkdir, writeFile } from "fs/promises";
+import { dirname, join } from "path";
 import { config } from "../config.js";
-import type { Chunk } from "../types.js";
+import { processDirectory } from "./chunker.js";
+import { generateEmbeddings } from "./embeddings.js";
+import { resetStore } from "./retriever.js";
+import { VectorStore } from "./vector-store.js";
 
-const CHUNK_SIZE = 400;
-const CHUNK_OVERLAP = 50;
+// Copia legible de los chunks (sin los vectores completos) para inspeccionar
+// cómo quedó partida la documentación.
+const PREVIEW_JSON = join(dirname(config.dbPath), "chunks-preview.json");
 
-type RawChunk = Omit<Chunk, "id"> & { id: string };
-
-function extractHeading(text: string): string {
-  const match = text.match(/^#+\s+(.+)/m);
-  return match?.[1]?.trim() ?? "";
-}
-
-function splitIntoChunks(text: string, source: string): RawChunk[] {
-  const words = text.split(/\s+/);
-  const chunks: RawChunk[] = [];
-
-  for (let i = 0; i < words.length; i += CHUNK_SIZE - CHUNK_OVERLAP) {
-    const content = words.slice(i, i + CHUNK_SIZE).join(" ");
-    if (content.trim().length > 10) {
-      chunks.push({
-        id: `${source}-chunk-${i}`,
-        content,
-        metadata: {
-          source,
-          heading: extractHeading(content),
-          position: i,
-          charCount: content.length,
-        },
-      });
-    }
-  }
-
-  return chunks;
-}
-
-async function generateEmbedding(text: string, client: OpenAI): Promise<number[]> {
-  const response = await client.embeddings.create({
-    model: config.openaiEmbeddingModel,
-    input: text,
-  });
-  const embedding = response.data[0]?.embedding;
-  if (!embedding) throw new Error("No embedding returned");
-  return embedding;
-}
-
+/** Pipeline de ingestión: Markdown → chunks → embeddings → vector store. */
 export async function ingestDocs(
   docsPath: string = config.docsPath,
 ): Promise<{ files: number; chunks: number }> {
@@ -57,63 +20,39 @@ export async function ingestDocs(
     throw new Error("OPENAI_API_KEY no configurada en .env");
   }
 
-  const openai = new OpenAI({ apiKey: config.openaiApiKey });
-  const db = new Database(config.dbPath);
-
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS chunks (
-      id        TEXT PRIMARY KEY,
-      content   TEXT NOT NULL,
-      source    TEXT NOT NULL,
-      heading   TEXT NOT NULL,
-      position  INTEGER NOT NULL,
-      char_count INTEGER NOT NULL,
-      embedding TEXT NOT NULL
-    )
-  `);
-  db.exec("DELETE FROM chunks");
-
-  const files = await readdir(docsPath);
-  const mdFiles = files.filter((f) => extname(f) === ".md");
-
-  const insert = db.prepare(`
-    INSERT INTO chunks (id, content, source, heading, position, char_count, embedding)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `);
-
-  let totalChunks = 0;
-
-  for (const file of mdFiles) {
-    const filePath = join(docsPath, file);
-    const content = await readFile(filePath, "utf-8");
-    const chunks = splitIntoChunks(content, file);
-
-    process.stdout.write(`Procesando ${file}: ${chunks.length} chunks `);
-
-    for (const chunk of chunks) {
-      const embedding = await generateEmbedding(chunk.content, openai);
-      insert.run(
-        chunk.id,
-        chunk.content,
-        chunk.metadata.source,
-        chunk.metadata.heading,
-        chunk.metadata.position,
-        chunk.metadata.charCount,
-        JSON.stringify(embedding)
-      );
-      process.stdout.write(".");
-    }
-
-    totalChunks += chunks.length;
-    console.log(" ✓");
+  const chunks = await processDirectory(docsPath);
+  if (chunks.length === 0) {
+    console.log("No se encontraron archivos .md en el directorio.");
+    return { files: 0, chunks: 0 };
   }
 
-  db.close();
-  console.log(
-    `\n✓ Ingestion completada: ${mdFiles.length} archivos, ${totalChunks} chunks indexados.`
-  );
+  console.log(`\nGenerando embeddings para ${chunks.length} chunks...`);
+  const embeddings = await generateEmbeddings(chunks.map((c) => c.content));
+  const dimensions = embeddings[0]?.length ?? 0;
+  console.log(`✓ Embeddings generados (${dimensions} dimensiones c/u)`);
 
-  return { files: mdFiles.length, chunks: totalChunks };
+  await mkdir(dirname(PREVIEW_JSON), { recursive: true });
+  const preview = chunks.map((chunk, i) => ({
+    id: chunk.id,
+    metadata: chunk.metadata,
+    content: chunk.content.slice(0, 200) + (chunk.content.length > 200 ? "..." : ""),
+    embeddingPreview: (embeddings[i] ?? []).slice(0, 5),
+  }));
+  await writeFile(PREVIEW_JSON, JSON.stringify(preview, null, 2), "utf-8");
+
+  // Cierra la conexión que use el retriever antes de recrear las tablas.
+  resetStore();
+  const store = new VectorStore(config.dbPath);
+  store.reset(dimensions);
+  store.insertMany(chunks.map((chunk, i) => ({ chunk, embedding: embeddings[i]! })));
+  const stored = store.size;
+  store.close();
+
+  const files = new Set(chunks.map((c) => c.metadata.source)).size;
+  console.log(`✓ ${stored} chunks guardados en ${config.dbPath}`);
+  console.log(`  Preview: ${PREVIEW_JSON}`);
+
+  return { files, chunks: stored };
 }
 
 // Permite seguir usando `npm run ingest` como script standalone. Al importar
@@ -121,5 +60,8 @@ export async function ingestDocs(
 // bloque no se ejecuta, porque process.argv[1] apunta al script que sí se
 // invocó directamente (tsx), no a este archivo.
 if (process.argv[1]?.endsWith("ingest.ts")) {
-  ingestDocs().catch(console.error);
+  ingestDocs().catch((err: Error) => {
+    console.error("Error durante la ingestión:", err.message);
+    process.exit(1);
+  });
 }

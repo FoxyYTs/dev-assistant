@@ -1,12 +1,10 @@
 import { readdir, readFile, writeFile, mkdir, stat } from "fs/promises";
 import { join, resolve, relative } from "path";
-import OpenAI from "openai";
 import { config } from "../config.js";
-import { queryDocuments } from "../rag/query.js";
+import { retrieveContext } from "../rag/retriever.js";
 import type { Issue } from "../types.js";
 
 const PROJECT_ROOT = process.cwd();
-const openai = new OpenAI({ apiKey: config.openaiApiKey });
 
 const IGNORED_DIRS = new Set(["node_modules", ".git", "dist", "data"]);
 
@@ -157,16 +155,22 @@ async function executeSearchDocs(input: Record<string, unknown>): Promise<string
   const topK = (input["top_k"] as number | undefined) ?? config.ragTopK;
 
   try {
-    const results = await queryDocuments(query, openai);
-    const top = results.slice(0, Math.min(topK, 10));
+    const chunks = await retrieveContext(query, Math.min(topK, 10));
+    if (chunks.length === 0) {
+      return JSON.stringify({
+        query,
+        results: [],
+        message: "El vector store está vacío. Ejecuta /ingest para cargar la documentación.",
+      });
+    }
 
     return JSON.stringify({
       query,
-      results: top.map((r) => ({
-        source: r.chunk.metadata.source,
-        heading: r.chunk.metadata.heading,
-        content: r.chunk.content,
-        score: r.score,
+      results: chunks.map((c) => ({
+        source: c.metadata.source,
+        heading: c.metadata.heading,
+        content: c.content,
+        score: Number(c.score.toFixed(3)),
       })),
     });
   } catch (err) {

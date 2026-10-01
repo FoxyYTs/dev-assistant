@@ -1,46 +1,12 @@
-import Anthropic from "@anthropic-ai/sdk";
-import OpenAI from "openai";
 import * as readline from "readline";
-import { config } from "./config.js";
-import { queryDocuments } from "./rag/query.js";
-import type { Message } from "./types.js";
+import { askWithRAG } from "./rag/rag-chain.js";
 
-const anthropic = new Anthropic({ apiKey: config.anthropicApiKey });
-const openai = new OpenAI({ apiKey: config.openaiApiKey });
-
-const history: Message[] = [];
-
-async function chat(userMessage: string): Promise<string> {
-  const results = await queryDocuments(userMessage, openai);
-
-  const context = results
-    .map((r) => `[Fuente: ${r.chunk.metadata.source}]\n${r.chunk.content}`)
-    .join("\n\n---\n\n");
-
-  const system = `Eres un asistente técnico experto en la API TaskFlow.
-Responde usando ÚNICAMENTE la información del contexto proporcionado.
-Si la respuesta no está en el contexto, indícalo claramente.
-
-CONTEXTO:
-${context}`;
-
-  history.push({ role: "user", content: userMessage });
-
-  const response = await anthropic.messages.create({
-    model: config.anthropicModel,
-    max_tokens: 1024,
-    system,
-    messages: history,
-  });
-
-  const text =
-    response.content[0]?.type === "text" ? response.content[0].text : "";
-
-  history.push({ role: "assistant", content: text });
-  return text;
-}
-
-async function main() {
+/**
+ * Chat RAG directo (`npm run rag-chat`): cada pregunta se responde solo con la
+ * documentación indexada, sin tools ni memoria entre preguntas. Para el agente
+ * completo usa `npm run dev`.
+ */
+async function main(): Promise<void> {
   console.log("╔══════════════════════════════════════════╗");
   console.log("║   DevAssistant — Documentación TaskFlow  ║");
   console.log("╚══════════════════════════════════════════╝");
@@ -51,7 +17,14 @@ async function main() {
     output: process.stdout,
   });
 
-  const ask = () => {
+  let closed = false;
+  rl.on("close", () => {
+    closed = true;
+  });
+
+  const ask = (): void => {
+    if (closed) return;
+
     rl.question("Tú: ", async (input) => {
       const msg = input.trim();
 
@@ -67,8 +40,9 @@ async function main() {
       }
 
       try {
-        const reply = await chat(msg);
-        console.log(`\nAsistente: ${reply}\n`);
+        process.stdout.write("Asistente: ");
+        await askWithRAG(msg, (chunk) => process.stdout.write(chunk));
+        process.stdout.write("\n\n");
       } catch (err) {
         console.error("Error:", err instanceof Error ? err.message : err);
       }
