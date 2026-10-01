@@ -1,118 +1,84 @@
-import Anthropic from "@anthropic-ai/sdk";
-import { config } from "../config.js";
+// Uso: npm run review <ruta-del-archivo>
+// Ejemplo: npm run review ./src/config.ts
+// Ejemplo con el fragmento del curso: npm run review ./examples/codigo-con-problemas.js
+
+import * as fs from "fs";
+import * as path from "path";
+import { streamClaude } from "../llm/streaming.js";
 import { CODE_REVIEWER_PROMPT } from "../llm/prompts.js";
 
-const anthropic = new Anthropic({ apiKey: config.anthropicApiKey });
+// Extensiones de archivo que soportamos
+const SUPPORTED_FILE_EXTENSIONS = new Set([
+  ".ts", ".tsx", ".js", ".jsx", ".py", ".go",
+  ".rs", ".java", ".cs", ".cpp", ".c", ".rb",
+  ".php", ".swift", ".kt", ".sql",
+]);
+// Límite de tamaño: archivos muy grandes consumen muchos tokens
+const MAX_CHARS = 20_000;
 
-interface CodeSample {
-  name: string;
-  language: string;
-  code: string;
+async function reviewFile(filePath: string): Promise<void> {
+  const absolutePath = path.resolve(filePath);
+
+  if (!fs.existsSync(absolutePath)) {
+    console.error(`❌ Archivo no encontrado: ${absolutePath}`);
+    process.exit(1);
+  }
+
+  const extension = path.extname(absolutePath).toLowerCase();
+  if (!SUPPORTED_FILE_EXTENSIONS.has(extension)) {
+    console.warn(
+      `⚠️  Extensión "${extension}" no reconocida. Continuando de todas formas...`,
+    );
+  }
+
+  const content = fs.readFileSync(absolutePath, "utf-8");
+  const totalLines = content.split("\n").length;
+  const fileName = path.basename(absolutePath);
+
+  let contenidoARevisar = content;
+  let sizeWarning = "";
+
+  if (content.length > MAX_CHARS) {
+    contenidoARevisar = content.slice(0, MAX_CHARS);
+    sizeWarning = `⚠️  Archivo muy grande — revisando los primeros ${MAX_CHARS} caracteres`;
+  }
+
+  // Mostrar header
+  console.log("╔════════════════════════════════════════╗");
+  console.log("║       DevAssistant — Code Reviewer     ║");
+  console.log("╚════════════════════════════════════════╝");
+  console.log(`\n📄 Archivo: ${fileName}`);
+  console.log(`   Ruta: ${absolutePath}`);
+  console.log(`   Líneas: ${totalLines} | Caracteres: ${content.length}`);
+  if (sizeWarning) console.log(sizeWarning);
+  console.log("\nAnalizando con Claude...\n");
+  console.log("─".repeat(60));
+
+  // Construir el prompt con el contexto del archivo
+  const prompt = `Por favor, revisa el siguiente archivo de código:
+
+**Archivo:** \`${fileName}\`
+**Extensión:** ${extension || "desconocida"}
+**Líneas:** ${totalLines}
+
+\`\`\`${extension.slice(1)}
+${contenidoARevisar}
+\`\`\``;
+
+  await streamClaude(prompt, CODE_REVIEWER_PROMPT);
+
+  console.log("─".repeat(60));
+  console.log("✓ Review completada.");
 }
 
-const SAMPLES: CodeSample[] = [
-  {
-    name: "Fragmento con SQL injection y comparación débil",
-    language: "javascript",
-    code: `async function getUser(id) {
-  const query = "SELECT * FROM users WHERE id = " + id;
-  const result = await db.query(query);
-  return result[0];
+const filePath = process.argv[2];
+if (!filePath) {
+  console.error("Uso: npm run review <ruta-del-archivo>");
+  console.error("Ejemplo: npm run review ./src/config.ts");
+  process.exit(1);
 }
 
-function calcularDescuento(precio, tipo) {
-  if (tipo == "vip") {
-    return precio * 0.8;
-  } else if (tipo == "regular") {
-    return precio * 0.9;
-  } else {
-    return precio;
-  }
-}`,
-  },
-  {
-    name: "Autenticación JWT con secreto débil",
-    language: "javascript",
-    code: `async function loginUser(email, password) {
-  const user = await db.users.findOne({ email, password });
-  if (user) {
-    const token = jwt.sign({ userId: user.id }, 'secret123');
-    return token;
-  }
-  return null;
-}`,
-  },
-  {
-    name: "Paginación con cursor-based (TaskFlow API)",
-    language: "typescript",
-    code: `async function getAllTasks(): Promise<Task[]> {
-  const allTasks: Task[] = [];
-  let page = 1;
-
-  while (true) {
-    const tasks = await api.get(\`/tasks?page=\${page}&limit=100\`);
-    allTasks.push(...tasks.data);
-    if (tasks.data.length < 100) break;
-    page++;
-  }
-
-  return allTasks;
-}`,
-  },
-  {
-    name: "Manejo de rate limiting sin retry",
-    language: "typescript",
-    code: `async function syncTasks(projectId: string) {
-  const tasks = [];
-  for (let i = 0; i < 200; i++) {
-    const task = await fetch(\`/v1/tasks/\${i}\`, {
-      headers: { Authorization: \`Bearer \${token}\` }
-    });
-    tasks.push(await task.json());
-  }
-  return tasks;
-}`,
-  },
-];
-
-async function reviewCode(sample: CodeSample): Promise<string> {
-  const response = await anthropic.messages.create({
-    model: config.anthropicModel,
-    max_tokens: 2048,
-    system: CODE_REVIEWER_PROMPT,
-    messages: [
-      {
-        role: "user",
-        content: `Código ${sample.language} a revisar:
-
-\`\`\`${sample.language}
-${sample.code}
-\`\`\``,
-      },
-    ],
-  });
-
-  return response.content[0]?.type === "text" ? response.content[0].text : "";
-}
-
-async function main() {
-  console.log("╔══════════════════════════════════════════╗");
-  console.log("║        Code Reviewer con Claude API      ║");
-  console.log("╚══════════════════════════════════════════╝\n");
-
-  for (const sample of SAMPLES) {
-    console.log(`\n${"═".repeat(60)}`);
-    console.log(`Analizando: ${sample.name}`);
-    console.log(`${"═".repeat(60)}\n`);
-    console.log(`Código:\n\`\`\`${sample.language}\n${sample.code}\n\`\`\`\n`);
-    console.log("Revisión de Claude:\n");
-
-    const review = await reviewCode(sample);
-    console.log(review);
-  }
-
-  console.log(`\n${"═".repeat(60)}`);
-  console.log("✓ Code review completado.");
-}
-
-main().catch(console.error);
+reviewFile(filePath).catch((error: Error) => {
+  console.error("Error:", error.message);
+  process.exit(1);
+});

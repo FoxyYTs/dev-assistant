@@ -26,7 +26,14 @@ export class DevAssistantAgent {
   private messages: Anthropic.Messages.MessageParam[] = [];
   private toolCallsLastTurn = 0;
 
-  async chat(userMessage: string): Promise<AgentResponse> {
+  /**
+   * Procesa un turno del usuario. Si se pasa `onChunk`, el texto de Claude se
+   * entrega fragmento a fragmento a medida que llega (streaming).
+   */
+  async chat(
+    userMessage: string,
+    onChunk?: (fragment: string) => void,
+  ): Promise<AgentResponse> {
     this.messages.push({ role: "user", content: userMessage });
     this.toolCallsLastTurn = 0;
 
@@ -35,13 +42,15 @@ export class DevAssistantAgent {
     let outputTokensThisTurn = 0;
 
     for (let iter = 0; iter < MAX_ITERATIONS; iter++) {
-      const response = await client.messages.create({
+      const stream = client.messages.stream({
         model: config.anthropicModel,
         max_tokens: 4096,
         system: AGENT_SYSTEM_PROMPT,
         tools: toAnthropicTools(),
         messages: this.messages,
       });
+      if (onChunk) stream.on("text", onChunk);
+      const response = await stream.finalMessage();
 
       inputTokensThisTurn += response.usage.input_tokens;
       outputTokensThisTurn += response.usage.output_tokens;

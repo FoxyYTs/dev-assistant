@@ -9,7 +9,6 @@ const PROJECT_ROOT = process.cwd();
 const openai = new OpenAI({ apiKey: config.openaiApiKey });
 
 const IGNORED_DIRS = new Set(["node_modules", ".git", "dist", "data"]);
-const SEARCHABLE_EXT = /\.(ts|js|json|md)$/;
 
 /**
  * Resuelve una ruta relativa dentro del proyecto y evita path traversal
@@ -27,57 +26,67 @@ function resolveSafePath(relPath: string): string {
   return target;
 }
 
-// --- list_files ---
+// --- Recorrido de archivos ---
 
-async function listFilesRecursive(
-  dir: string,
-  depth: number,
-  maxDepth: number,
-): Promise<string[]> {
+async function collectFiles(dir: string, extension?: string): Promise<string[]> {
   const entries = await readdir(dir, { withFileTypes: true });
-  let results: string[] = [];
+  const results: string[] = [];
 
   for (const entry of entries) {
-    if (IGNORED_DIRS.has(entry.name)) continue;
+    if (IGNORED_DIRS.has(entry.name) || entry.name.startsWith(".")) continue;
     const full = join(dir, entry.name);
-    const relPath = relative(PROJECT_ROOT, full);
 
     if (entry.isDirectory()) {
-      results.push(`${relPath}/`);
-      if (depth < maxDepth) {
-        results = results.concat(
-          await listFilesRecursive(full, depth + 1, maxDepth),
-        );
-      }
-    } else {
-      results.push(relPath);
+      results.push(...(await collectFiles(full, extension)));
+    } else if (entry.isFile() && (!extension || entry.name.endsWith(extension))) {
+      results.push(full);
     }
   }
 
   return results;
 }
 
+// --- list_files ---
+
+const MAX_LIST_RESULTS = 200;
+
 async function executeListFiles(input: Record<string, unknown>): Promise<string> {
   const path = (input["path"] as string | undefined) ?? ".";
-  const recursive = (input["recursive"] as boolean | undefined) ?? false;
+  const extension = input["extension"] as string | undefined;
   const target = resolveSafePath(path);
 
-  const files = await listFilesRecursive(target, 0, recursive ? 4 : 0);
-  return JSON.stringify({ path, count: files.length, files });
+  const info = await stat(target);
+  if (!info.isDirectory()) {
+    return JSON.stringify({
+      error: `"${path}" no es un directorio. Usa read_file para leerlo.`,
+    });
+  }
+
+  const files = (await collectFiles(target, extension)).map((f) =>
+    relative(PROJECT_ROOT, f),
+  );
+
+  return JSON.stringify({
+    path,
+    extension: extension ?? null,
+    count: files.length,
+    files: files.slice(0, MAX_LIST_RESULTS),
+    truncated: files.length > MAX_LIST_RESULTS,
+  });
 }
 
 // --- read_file ---
 
-const MAX_READ_CHARS = 8000;
+const MAX_READ_CHARS = 50_000;
 
 async function executeReadFile(input: Record<string, unknown>): Promise<string> {
-  const path = input["path"] as string;
-  const target = resolveSafePath(path);
+  const filePath = input["file_path"] as string;
+  const target = resolveSafePath(filePath);
 
   const info = await stat(target);
   if (info.isDirectory()) {
     return JSON.stringify({
-      error: `"${path}" es un directorio, no un archivo. Usa list_files.`,
+      error: `"${filePath}" es un directorio, no un archivo. Usa list_files.`,
     });
   }
 
@@ -85,7 +94,7 @@ async function executeReadFile(input: Record<string, unknown>): Promise<string> 
   const truncated = content.length > MAX_READ_CHARS;
 
   return JSON.stringify({
-    path,
+    file_path: filePath,
     content: truncated ? content.slice(0, MAX_READ_CHARS) : content,
     truncated,
     totalChars: content.length,
@@ -94,61 +103,51 @@ async function executeReadFile(input: Record<string, unknown>): Promise<string> 
 
 // --- search_code ---
 
-const MAX_SEARCH_RESULTS = 30;
-
-function escapeRegex(text: string): string {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-async function searchInDir(
-  dir: string,
-  pattern: RegExp,
-  results: Array<{ file: string; line: number; text: string }>,
-): Promise<void> {
-  if (results.length >= MAX_SEARCH_RESULTS) return;
-
-  const entries = await readdir(dir, { withFileTypes: true });
-
-  for (const entry of entries) {
-    if (results.length >= MAX_SEARCH_RESULTS) return;
-    if (IGNORED_DIRS.has(entry.name)) continue;
-
-    const full = join(dir, entry.name);
-
-    if (entry.isDirectory()) {
-      await searchInDir(full, pattern, results);
-    } else if (SEARCHABLE_EXT.test(entry.name)) {
-      const content = await readFile(full, "utf-8");
-      const lines = content.split("\n");
-
-      for (let i = 0; i < lines.length; i++) {
-        if (results.length >= MAX_SEARCH_RESULTS) break;
-        const line = lines[i]!;
-        if (pattern.test(line)) {
-          results.push({
-            file: relative(PROJECT_ROOT, full),
-            line: i + 1,
-            text: line.trim(),
-          });
-        }
-      }
-    }
-  }
-}
+const MAX_SEARCH_RESULTS = 20;
+const CONTEXT_LINES = 2;
 
 async function executeSearchCode(input: Record<string, unknown>): Promise<string> {
-  const patternStr = input["pattern"] as string;
-  const path = (input["path"] as string | undefined) ?? "src";
+  const pattern = input["pattern"] as string;
+  const path = (input["path"] as string | undefined) ?? ".";
+  const fileExtension = input["file_extension"] as string | undefined;
   const target = resolveSafePath(path);
 
-  // Búsqueda literal (no regex) — más segura y predecible cuando el patrón
-  // lo genera el modelo a partir de la petición del usuario.
-  const pattern = new RegExp(escapeRegex(patternStr), "i");
+  const files = await collectFiles(target, fileExtension);
+  const results: Array<{ file: string; line: number; context: string }> = [];
 
-  const results: Array<{ file: string; line: number; text: string }> = [];
-  await searchInDir(target, pattern, results);
+  for (const file of files) {
+    if (results.length >= MAX_SEARCH_RESULTS) break;
 
-  return JSON.stringify({ pattern: patternStr, matches: results.length, results });
+    let content: string;
+    try {
+      content = await readFile(file, "utf-8");
+    } catch {
+      continue;
+    }
+
+    const lines = content.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      if (results.length >= MAX_SEARCH_RESULTS) break;
+      // Búsqueda literal y sensible a mayúsculas, como describe la tool.
+      if (!lines[i]!.includes(pattern)) continue;
+
+      const start = Math.max(0, i - CONTEXT_LINES);
+      const end = Math.min(lines.length - 1, i + CONTEXT_LINES);
+      const context = lines
+        .slice(start, end + 1)
+        .map((text, k) => `${start + k === i ? ">" : " "} ${start + k + 1}: ${text}`)
+        .join("\n");
+
+      results.push({ file: relative(PROJECT_ROOT, file), line: i + 1, context });
+    }
+  }
+
+  return JSON.stringify({
+    pattern,
+    matches: results.length,
+    truncated: results.length >= MAX_SEARCH_RESULTS,
+    results,
+  });
 }
 
 // --- search_docs ---

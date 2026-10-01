@@ -17,6 +17,9 @@ function printBanner(): void {
   console.log("╚════════════════════════════════════════╝");
   console.log("");
   console.log("💬 Escribe tu pregunta y presiona Enter.");
+  console.log(
+    `   Tengo acceso a ${TOOL_DEFINITIONS.length} tools: ${TOOL_DEFINITIONS.map((t) => t.name).join(", ")}`,
+  );
   console.log("💡 Tip: usa /ingest para cargar documentación");
   console.log("   Comandos: /ingest [path],");
   console.log("             /clear, /stats, /tools, /exit");
@@ -133,12 +136,16 @@ async function main(): Promise<void> {
       }
 
       try {
-        const response = await agent.chat(guardrailResult.sanitized);
+        process.stdout.write("\nDevAssistant: ");
+        const response = await agent.chat(guardrailResult.sanitized, (fragment) => {
+          process.stdout.write(fragment);
+        });
         conversation.recordTurn(response.inputTokens, response.outputTokens);
 
-        console.log(`\nDevAssistant: ${response.text}\n`);
+        process.stdout.write("\n\n");
         if (response.toolsUsed.length > 0) {
-          console.log(`   (herramientas usadas: ${response.toolsUsed.join(", ")})\n`);
+          const uniqueTools = [...new Set(response.toolsUsed)];
+          console.log(`   (herramientas usadas: ${uniqueTools.join(", ")})\n`);
         }
       } catch (err) {
         console.error("Error:", err instanceof Error ? err.message : err);
